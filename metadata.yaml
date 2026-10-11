@@ -1,0 +1,8 @@
+name: astrbot_plugin_session_plugin_filter
+display_name: 会话插件过滤
+short_desc: 按会话给插件开白名单/黑名单，带可视化配置面板。
+desc: 按会话配置插件白名单或黑名单，同时过滤指令、事件钩子和 LLM 函数工具，支持通配符会话与规则复用，自带可视化配置面板，用来替代原生自定义规则里的插件开关。
+version: v1.0.0
+author: yun474
+repo: https://github.com/yun474/astrbot_plugin_session_plugin_filter
+astrbot_version: ">=4.26"
