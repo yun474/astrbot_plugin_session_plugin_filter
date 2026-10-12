@@ -1,4 +1,9 @@
-"""会话插件规则：存储、校验与会话匹配。"""
+"""会话插件规则：存储、校验与判定。
+
+判定方式：
+1. 命中某会话的所有规则叠加生效，插件必须被每一条都放行才能用；
+2. 被某条规则标为「专属」的插件，只能在这条规则覆盖的会话里使用。
+"""
 
 import json
 import re
@@ -7,10 +12,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 MODES = ("whitelist", "blacklist")
+EXCLUDE_PREFIX = "!"
 
 DEFAULT_SETTINGS = {
     # 总开关，关闭后所有规则失效
     "enabled": True,
+    # 同时屏蔽被拦插件的事件钩子（on_llm_request 等）和 LLM 函数工具
+    "strict": True,
     # 命中被屏蔽插件的指令时直接吞掉消息，不再落到 LLM 闲聊
     "silent_blocked_command": True,
     # 管理员不受规则限制
@@ -30,19 +38,40 @@ def _str_list(value) -> list[str]:
     return list(dict.fromkeys(v for v in items if v))
 
 
+class SessionMatcher:
+    def __init__(self, sessions: list[str]) -> None:
+        self.exact = {s for s in sessions if "*" not in s and "?" not in s}
+        self.patterns = [compile_pattern(s) for s in sessions if s not in self.exact]
+
+    def __call__(self, umo: str) -> bool:
+        return umo in self.exact or any(p.fullmatch(umo) for p in self.patterns)
+
+
 @dataclass
 class Rule:
     id: str
     name: str
     mode: str = "whitelist"
     enabled: bool = True
-    # 同时过滤该插件的事件钩子（on_llm_request 等）和 LLM 函数工具
-    strict: bool = True
     plugins: list[str] = field(default_factory=list)
+    # 专属插件：只能在本规则覆盖的会话里使用
+    exclusive: list[str] = field(default_factory=list)
+    # 会话 ID 或通配符，以 ! 开头表示排除
     sessions: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        # 白名单里的专属插件必然放行；黑名单里屏蔽和专属互斥，以专属为准
+        if self.mode == "whitelist":
+            self.plugins = list(dict.fromkeys(self.plugins + self.exclusive))
+        else:
+            self.plugins = [p for p in self.plugins if p not in self.exclusive]
         self._plugin_set = set(self.plugins)
+        self._include = SessionMatcher(
+            [s for s in self.sessions if not s.startswith(EXCLUDE_PREFIX)]
+        )
+        self._exclude = SessionMatcher(
+            [s[1:] for s in self.sessions if s.startswith(EXCLUDE_PREFIX)]
+        )
 
     @classmethod
     def from_dict(cls, data: dict) -> "Rule":
@@ -52,16 +81,40 @@ class Rule:
             name=str(data.get("name") or "").strip() or "未命名规则",
             mode=mode if mode in MODES else "whitelist",
             enabled=bool(data.get("enabled", True)),
-            strict=bool(data.get("strict", True)),
             plugins=_str_list(data.get("plugins")),
+            exclusive=_str_list(data.get("exclusive")),
             sessions=_str_list(data.get("sessions")),
         )
 
     def to_dict(self) -> dict:
         return asdict(self)
 
+    def covers(self, umo: str) -> bool:
+        return self._include(umo) and not self._exclude(umo)
+
     def allows(self, plugin_name: str) -> bool:
         return (plugin_name in self._plugin_set) == (self.mode == "whitelist")
+
+
+@dataclass
+class Verdict:
+    """某个会话的判定结果"""
+
+    rules: list[Rule]
+    exclusive: dict[str, list[Rule]]
+
+    def blocker(self, plugin_name: str) -> Rule | None:
+        """返回拦下该插件的规则，放行时返回 None"""
+        for rule in self.rules:
+            if not rule.allows(plugin_name):
+                return rule
+        owners = self.exclusive.get(plugin_name)
+        if owners and not any(rule in self.rules for rule in owners):
+            return owners[0]
+        return None
+
+    def allows(self, plugin_name: str) -> bool:
+        return self.blocker(plugin_name) is None
 
 
 class RuleStore:
@@ -69,8 +122,7 @@ class RuleStore:
         self.path = path
         self.settings = dict(DEFAULT_SETTINGS)
         self.rules: list[Rule] = []
-        self._exact: dict[str, Rule] = {}
-        self._patterns: list[tuple[re.Pattern, Rule]] = []
+        self._exclusive: dict[str, list[Rule]] = {}
 
     def load(self) -> None:
         if self.path.exists():
@@ -108,25 +160,16 @@ class RuleStore:
                 rule.id = uuid.uuid4().hex[:8]
             seen_ids.add(rule.id)
         self.rules = rules
-        self._build_index()
 
-    def _build_index(self) -> None:
-        # 精确会话优先于通配符；同类之间按规则顺序，先到先得
-        self._exact, self._patterns = {}, []
-        for rule in self.rules:
-            if not rule.enabled:
-                continue
-            for session in rule.sessions:
-                if "*" in session or "?" in session:
-                    self._patterns.append((compile_pattern(session), rule))
-                else:
-                    self._exact.setdefault(session, rule)
+        self._exclusive = {}
+        for rule in rules:
+            if rule.enabled:
+                for name in rule.exclusive:
+                    self._exclusive.setdefault(name, []).append(rule)
 
-    def match(self, umo: str) -> Rule | None:
-        rule = self._exact.get(umo)
-        if rule:
-            return rule
-        for pattern, rule in self._patterns:
-            if pattern.fullmatch(umo):
-                return rule
-        return None
+    def resolve(self, umo: str) -> Verdict | None:
+        """计算会话的判定结果；没有任何规则影响该会话时返回 None"""
+        rules = [rule for rule in self.rules if rule.enabled and rule.covers(umo)]
+        if not rules and not self._exclusive:
+            return None
+        return Verdict(rules, self._exclusive)

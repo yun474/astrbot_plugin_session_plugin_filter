@@ -10,7 +10,7 @@
     <header class="topbar">
       <div>
         <h1>会话插件过滤</h1>
-        <p class="muted">按会话决定哪些插件能响应：白名单只放行勾选的插件，黑名单只屏蔽勾选的插件。</p>
+        <p class="muted">按会话决定哪些插件能用。一个会话命中多条规则时叠加生效，插件要每条都放行才能用。</p>
       </div>
       <div class="topbar-actions">
         <span id="dirty" class="dirty" hidden>有未保存的修改</span>
@@ -24,6 +24,11 @@
         <input type="checkbox" data-setting="enabled" />
         <span class="switch"></span>
         <span><b>启用插件过滤</b><small>总开关，关闭后所有规则暂停生效</small></span>
+      </label>
+      <label class="switch-row">
+        <input type="checkbox" data-setting="strict" />
+        <span class="switch"></span>
+        <span><b>严格模式</b><small>被拦插件的事件钩子和 LLM 工具也一起屏蔽，关闭后只拦指令和消息监听</small></span>
       </label>
       <label class="switch-row">
         <input type="checkbox" data-setting="silent_blocked_command" />
@@ -56,7 +61,7 @@
     <section class="card tester">
       <div class="section-head"><h2>命中测试</h2><span class="muted">按当前（含未保存）配置预览</span></div>
       <input id="test-umo" class="input" list="session-options" placeholder="输入会话 ID，例如 aiocqhttp:GroupMessage:123456" />
-      <div id="test-result" class="test-result muted">输入会话 ID 看看会命中哪条规则</div>
+      <div id="test-result" class="test-result muted">输入会话 ID 看看这个会话里哪些插件能用</div>
     </section>
 
     <datalist id="session-options"></datalist>

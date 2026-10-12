@@ -1,10 +1,7 @@
 const bridge = window.AstrBotPluginView || window.AstrBotPluginPage;
 
 const MODE_TEXT = { whitelist: "白名单", blacklist: "黑名单" };
-const MODE_HINT = {
-  whitelist: "只有勾选的插件能在这些会话里响应，其余插件全部屏蔽。",
-  blacklist: "勾选的插件在这些会话里被屏蔽，其余插件照常工作。",
-};
+const MODE_OPTION = { whitelist: "只允许勾选的插件", blacklist: "禁用勾选的插件" };
 const QUICK_PATTERNS = [
   ["所有群聊", "*:GroupMessage:*"],
   ["所有私聊", "*:FriendMessage:*"],
@@ -41,39 +38,58 @@ function toast(message, isError = false) {
   toast.timer = setTimeout(() => (el.hidden = true), isError ? 5000 : 2500);
 }
 
-// ---------- 规则匹配（与后端 rules.py 保持一致） ----------
+const newId = () => Math.random().toString(16).slice(2, 10);
+const pluginName = (name) => plugins.find((p) => p.name === name)?.display_name || name;
+const selectedRule = () => draft.rules.find((r) => r.id === selectedId);
 
+// ---------- 规则判定（与后端 rules.py 保持一致） ----------
+
+const isExclude = (s) => s.startsWith("!");
 const isPattern = (s) => /[*?]/.test(s);
 
-function patternRegex(pattern) {
+function sessionMatches(pattern, umo) {
+  if (!isPattern(pattern)) return pattern === umo;
   const body = pattern
     .replace(/[.+^${}()|[\]\\]/g, "\\$&")
     .replace(/\*/g, ".*")
     .replace(/\?/g, ".");
-  return new RegExp(`^${body}$`);
+  return new RegExp(`^${body}$`).test(umo);
 }
 
-function matchRule(umo) {
-  const rules = draft.rules.filter((r) => r.enabled);
-  for (const rule of rules) {
-    if (rule.sessions.some((s) => !isPattern(s) && s === umo)) return [rule, "精确匹配"];
-  }
-  for (const rule of rules) {
-    const hit = rule.sessions.find((s) => isPattern(s) && patternRegex(s).test(umo));
-    if (hit) return [rule, `通配符 ${hit}`];
-  }
-  return [null, ""];
+function covers(rule, umo) {
+  const hit = (list) => list.some((s) => sessionMatches(s, umo));
+  const include = rule.sessions.filter((s) => !isExclude(s));
+  const exclude = rule.sessions.filter(isExclude).map((s) => s.slice(1));
+  return hit(include) && !hit(exclude);
 }
 
-const allows = (rule, name) => rule.plugins.includes(name) === (rule.mode === "whitelist");
-const selectedRule = () => draft.rules.find((r) => r.id === selectedId);
+const ruleAllows = (rule, name) => rule.plugins.includes(name) === (rule.mode === "whitelist");
+
+// 返回拦截原因，放行时返回 null
+function blockReason(name, matched) {
+  for (const rule of matched) {
+    if (!ruleAllows(rule, name)) {
+      return rule.mode === "whitelist" ? `不在「${rule.name}」的允许列表里` : `被「${rule.name}」禁用`;
+    }
+  }
+  const owners = draft.rules.filter((r) => r.enabled && r.exclusive.includes(name));
+  if (owners.length && !owners.some((r) => matched.includes(r))) {
+    return `专属于「${owners.map((r) => r.name).join("」「")}」的会话`;
+  }
+  return null;
+}
 
 // ---------- 状态 ----------
 
 function setDraft(data) {
   draft = {
     settings: { ...data.settings },
-    rules: data.rules.map((r) => ({ ...r, plugins: [...r.plugins], sessions: [...r.sessions] })),
+    rules: data.rules.map((r) => ({
+      ...r,
+      plugins: [...r.plugins],
+      exclusive: [...(r.exclusive || [])],
+      sessions: [...r.sessions],
+    })),
   };
   savedJson = JSON.stringify(draft);
   if (!selectedRule()) selectedId = draft.rules[0]?.id ?? null;
@@ -113,8 +129,7 @@ for (const input of document.querySelectorAll("[data-setting]")) {
 // ---------- 规则列表 ----------
 
 function renderRuleList() {
-  const list = $("rule-list");
-  list.replaceChildren(
+  $("rule-list").replaceChildren(
     ...draft.rules.map((rule) =>
       h(
         "li",
@@ -134,7 +149,17 @@ function renderRuleList() {
             ? h("span", { class: `tag ${rule.mode}` }, MODE_TEXT[rule.mode])
             : h("span", { class: "tag off" }, "已停用"),
         ),
-        h("small", {}, `${rule.plugins.length} 个插件 · ${rule.sessions.length} 个会话`),
+        h(
+          "small",
+          {},
+          [
+            `${rule.sessions.length} 个会话`,
+            `${rule.plugins.length} 个插件`,
+            rule.exclusive.length ? `${rule.exclusive.length} 个专属` : "",
+          ]
+            .filter(Boolean)
+            .join(" · "),
+        ),
       ),
     ),
   );
@@ -149,12 +174,12 @@ function addRule(rule) {
 
 $("add-rule").addEventListener("click", () => {
   addRule({
-    id: Math.random().toString(16).slice(2, 10),
+    id: newId(),
     name: `规则 ${draft.rules.length + 1}`,
     mode: "whitelist",
     enabled: true,
-    strict: true,
     plugins: [],
+    exclusive: [],
     sessions: [],
   });
 });
@@ -187,6 +212,22 @@ function switchRow(checked, title, desc, onChange) {
   );
 }
 
+function ruleSummary(rule) {
+  const sessions = rule.sessions.filter((s) => !isExclude(s)).length;
+  if (!sessions) return "还没添加会话，这条规则暂时不会限制任何会话里的插件。";
+  const where = `在这 ${sessions} 个会话里`;
+  const main =
+    rule.mode === "whitelist"
+      ? `${where}只能用勾选的 ${rule.plugins.length} 个插件，其余插件全部失效`
+      : rule.plugins.length
+        ? `${where}禁用勾选的 ${rule.plugins.length} 个插件`
+        : `${where}不限制插件`;
+  const exclusive = rule.exclusive.length
+    ? `；${rule.exclusive.map(pluginName).join("、")} 只能在这些会话里用，别的会话都用不了`
+    : "";
+  return `${main}${exclusive}。`;
+}
+
 function renderEditor() {
   const editor = $("editor");
   const rule = selectedRule();
@@ -195,75 +236,54 @@ function renderEditor() {
     return;
   }
 
-  const update = (patch, full = false) => {
-    Object.assign(rule, patch);
+  const summary = h("div", { class: "summary" });
+  const refreshSummary = () => (summary.textContent = ruleSummary(rule));
+  const onEdit = (full = false) => {
+    refreshSummary();
     renderRuleList();
     if (full) renderEditor();
     changed();
   };
+  refreshSummary();
 
   editor.replaceChildren(
+    summary,
     h(
       "div",
-      { class: "field" },
-      h("label", { class: "field-title", for: "rule-name" }, "规则名称"),
-      h("input", {
-        id: "rule-name",
-        class: "input",
-        value: rule.name,
-        maxlength: "40",
-        oninput: (e) => update({ name: e.target.value }),
-      }),
-    ),
-    h(
-      "div",
-      { class: "field" },
-      switchRow(rule.enabled, "启用这条规则", "停用后保留配置，但不再参与匹配", (v) => update({ enabled: v })),
-    ),
-    h(
-      "div",
-      { class: "field" },
-      h("div", { class: "field-title" }, "过滤模式"),
+      { class: "field row-2" },
       h(
         "div",
-        { class: "segmented" },
-        ...Object.entries(MODE_TEXT).map(([mode, text]) =>
-          h(
-            "button",
-            {
-              class: `${mode}${rule.mode === mode ? " on" : ""}`,
-              onclick: () => update({ mode }, true),
-            },
-            text,
-          ),
-        ),
+        {},
+        h("label", { class: "field-title", for: "rule-name" }, "规则名称"),
+        h("input", {
+          id: "rule-name",
+          class: "input",
+          value: rule.name,
+          maxlength: "40",
+          oninput: (e) => {
+            rule.name = e.target.value;
+            onEdit();
+          },
+        }),
       ),
-      h("p", { class: "hint" }, MODE_HINT[rule.mode]),
+      switchRow(rule.enabled, "启用", "停用后保留配置但不生效", (v) => {
+        rule.enabled = v;
+        onEdit();
+      }),
     ),
-    h(
-      "div",
-      { class: "field" },
-      switchRow(
-        rule.strict,
-        "严格模式",
-        "同时屏蔽被拦插件的事件钩子（LLM 请求前后、发送前装饰等）和 LLM 函数工具；关闭后只拦指令和消息监听，跟原生规则一样",
-        (v) => update({ strict: v }),
-      ),
-    ),
-    pluginField(rule),
-    sessionField(rule),
+    sessionField(rule, onEdit),
+    pluginField(rule, onEdit),
     editorFoot(rule),
   );
 }
 
-function pluginField(rule) {
+function pluginField(rule, onEdit) {
   const count = h("span", { class: "muted" });
-  const warn = h("p", { class: "hint", style: "color: var(--warn)" });
   const list = h("div", { class: "plugin-list" });
 
   const rows = () => {
     const known = new Set(plugins.map((p) => p.name));
-    const missing = rule.plugins
+    const missing = [...new Set([...rule.plugins, ...rule.exclusive])]
       .filter((name) => !known.has(name))
       .map((name) => ({ name, display_name: name, desc: "", missing: true }));
     const q = pluginQuery.toLowerCase();
@@ -272,58 +292,82 @@ function pluginField(rule) {
     );
   };
 
-  const toggle = (name, on) => {
-    const set = new Set(rule.plugins);
+  const setIn = (key, name, on) => {
+    const set = new Set(rule[key]);
     on ? set.add(name) : set.delete(name);
-    rule.plugins = [...set];
+    rule[key] = [...set];
+  };
+
+  // 白名单：专属插件必须在允许列表里；黑名单：禁用和专属互斥
+  const setChecked = (name, on) => {
+    setIn("plugins", name, on);
+    if (rule.mode === "whitelist" ? !on : on) setIn("exclusive", name, false);
+  };
+  const setExclusive = (name, on) => {
+    setIn("exclusive", name, on);
+    if (on) setIn("plugins", name, rule.mode === "whitelist");
   };
 
   const refresh = () => {
     const visible = rows();
     count.textContent = `已勾选 ${rule.plugins.length} / ${plugins.length}`;
-    warn.hidden = !(rule.mode === "whitelist" && rule.plugins.length === 0);
-    warn.textContent = "白名单还是空的：这些会话里除系统插件外的插件都会被屏蔽";
     list.replaceChildren(
-      ...visible.map((p) =>
-        h(
-          "label",
+      ...visible.map((p) => {
+        const exclusive = rule.exclusive.includes(p.name);
+        return h(
+          "div",
           { class: "plugin-row" },
-          h("input", {
-            type: "checkbox",
-            checked: rule.plugins.includes(p.name),
-            onchange: (e) => {
-              toggle(p.name, e.target.checked);
-              onEdit();
-            },
-          }),
           h(
-            "div",
-            { class: "meta" },
+            "label",
+            { class: "plugin-check" },
+            h("input", {
+              type: "checkbox",
+              checked: rule.plugins.includes(p.name),
+              onchange: (e) => {
+                setChecked(p.name, e.target.checked);
+                update();
+              },
+            }),
             h(
               "div",
-              {},
-              p.display_name,
-              p.missing ? h("span", { class: "tag off" }, "未安装") : null,
-              p.activated === false ? h("span", { class: "tag off" }, "未启用") : null,
+              { class: "meta" },
+              h(
+                "div",
+                {},
+                p.display_name,
+                p.missing ? h("span", { class: "tag off" }, "未安装") : null,
+                p.activated === false ? h("span", { class: "tag off" }, "未启用") : null,
+              ),
+              h("div", { class: "mono muted" }, p.name),
+              p.desc ? h("div", { class: "desc", title: p.desc }, p.desc) : null,
             ),
-            h("div", { class: "mono muted" }, p.name),
-            p.desc ? h("div", { class: "desc", title: p.desc }, p.desc) : null,
           ),
-        ),
-      ),
+          h(
+            "button",
+            {
+              class: `lock${exclusive ? " on" : ""}`,
+              title: "开启后，这个插件只能在本规则的会话里使用，其他会话一律失效",
+              onclick: () => {
+                setExclusive(p.name, !exclusive);
+                update();
+              },
+            },
+            exclusive ? "🔒 专属" : "专属",
+          ),
+        );
+      }),
     );
     if (!visible.length) list.append(h("p", { class: "empty" }, "没有匹配的插件"));
   };
 
-  const onEdit = () => {
+  const update = () => {
     refresh();
-    renderRuleList();
-    changed();
+    onEdit();
   };
 
   const bulk = (fn) => () => {
-    for (const p of rows()) toggle(p.name, fn(rule.plugins.includes(p.name)));
-    onEdit();
+    for (const p of rows()) setChecked(p.name, fn(rule.plugins.includes(p.name)));
+    update();
   };
 
   refresh();
@@ -333,30 +377,55 @@ function pluginField(rule) {
     h(
       "div",
       { class: "field-title" },
-      h("span", {}, rule.mode === "whitelist" ? "放行的插件 " : "屏蔽的插件 ", count),
+      h("span", {}, "插件 ", count),
       h(
         "div",
-        { class: "row" },
-        h("button", { class: "btn ghost small", onclick: bulk(() => true) }, "全选"),
-        h("button", { class: "btn ghost small", onclick: bulk(() => false) }, "清空"),
-        h("button", { class: "btn ghost small", onclick: bulk((on) => !on) }, "反选"),
+        { class: "segmented" },
+        ...Object.entries(MODE_OPTION).map(([mode, text]) =>
+          h(
+            "button",
+            {
+              class: `${mode}${rule.mode === mode ? " on" : ""}`,
+              onclick: () => {
+                if (rule.mode === mode) return;
+                rule.mode = mode;
+                // 切换模式时保持专属插件可用
+                if (mode === "whitelist") rule.plugins = [...new Set([...rule.plugins, ...rule.exclusive])];
+                else rule.plugins = rule.plugins.filter((n) => !rule.exclusive.includes(n));
+                onEdit(true);
+              },
+            },
+            text,
+          ),
+        ),
       ),
     ),
-    h("input", {
-      class: "input",
-      placeholder: "搜索插件名称、ID 或简介（全选/清空/反选只作用于搜索结果）",
-      value: pluginQuery,
-      oninput: (e) => {
-        pluginQuery = e.target.value;
-        refresh();
-      },
-    }),
-    warn,
+    h(
+      "div",
+      { class: "row plugin-tools" },
+      h("input", {
+        class: "input",
+        placeholder: "搜索插件名称、ID 或简介",
+        value: pluginQuery,
+        oninput: (e) => {
+          pluginQuery = e.target.value;
+          refresh();
+        },
+      }),
+      h("button", { class: "btn ghost small", onclick: bulk(() => true) }, "全选"),
+      h("button", { class: "btn ghost small", onclick: bulk(() => false) }, "清空"),
+      h("button", { class: "btn ghost small", onclick: bulk((on) => !on) }, "反选"),
+    ),
     list,
+    h(
+      "p",
+      { class: "hint" },
+      "「专属」：这个插件只能在本规则的会话里用，在其他所有会话里都失效。全选/清空/反选只作用于搜索结果。",
+    ),
   );
 }
 
-function sessionField(rule) {
+function sessionField(rule, onEdit) {
   const chips = h("div", { class: "chips" });
   const suggestions = h("div", { class: "suggestions", hidden: true });
   let highlighted = -1;
@@ -364,7 +433,7 @@ function sessionField(rule) {
 
   const input = h("input", {
     class: "input",
-    placeholder: "搜索已知会话，或直接输入会话 ID / 通配符后回车",
+    placeholder: "按群名 / 会话 ID 搜索，或直接输入后回车",
     oninput: () => showSuggestions(),
     onfocus: () => showSuggestions(),
     onblur: () => (suggestions.hidden = true),
@@ -373,7 +442,8 @@ function sessionField(rule) {
         e.preventDefault();
         if (!options.length) return;
         highlighted = (highlighted + (e.key === "ArrowDown" ? 1 : -1) + options.length) % options.length;
-        paintHighlight();
+        [...suggestions.children].forEach((el, i) => el.classList.toggle("hl", i === highlighted));
+        suggestions.children[highlighted]?.scrollIntoView({ block: "nearest" });
       } else if (e.key === "Enter") {
         e.preventDefault();
         add(highlighted >= 0 ? options[highlighted].umo : input.value);
@@ -385,11 +455,11 @@ function sessionField(rule) {
 
   function add(value) {
     const umo = value.trim();
-    if (!umo) return;
+    if (!umo || umo === "!") return;
     if (!rule.sessions.includes(umo)) rule.sessions.push(umo);
     input.value = "";
     suggestions.hidden = true;
-    onEdit();
+    update();
   }
 
   function showSuggestions() {
@@ -419,31 +489,27 @@ function sessionField(rule) {
     suggestions.hidden = !options.length;
   }
 
-  function paintHighlight() {
-    [...suggestions.children].forEach((el, i) => el.classList.toggle("hl", i === highlighted));
-    suggestions.children[highlighted]?.scrollIntoView({ block: "nearest" });
+  function label(entry) {
+    const umo = isExclude(entry) ? entry.slice(1) : entry;
+    const name = isPattern(umo) ? "通配符" : sessionNames.get(umo) || "未命名会话";
+    return isExclude(entry) ? [h("span", { class: "tag blacklist" }, "排除"), " ", name] : [name];
   }
 
   function refresh() {
     chips.replaceChildren(
-      ...rule.sessions.map((umo) =>
+      ...rule.sessions.map((entry) =>
         h(
           "div",
           { class: "chip" },
-          h(
-            "div",
-            { class: "meta" },
-            h("div", {}, isPattern(umo) ? "通配符" : sessionNames.get(umo) || "未命名会话"),
-            h("div", { class: "mono muted" }, umo),
-          ),
+          h("div", { class: "meta" }, h("div", {}, ...label(entry)), h("div", { class: "mono muted" }, entry)),
           h(
             "button",
             {
               class: "x",
               title: "移除",
               onclick: () => {
-                rule.sessions = rule.sessions.filter((s) => s !== umo);
-                onEdit();
+                rule.sessions = rule.sessions.filter((s) => s !== entry);
+                update();
               },
             },
             "×",
@@ -451,13 +517,12 @@ function sessionField(rule) {
         ),
       ),
     );
-    if (!rule.sessions.length) chips.append(h("p", { class: "empty" }, "还没有会话，规则不会命中任何地方"));
+    if (!rule.sessions.length) chips.append(h("p", { class: "empty" }, "还没有会话"));
   }
 
-  function onEdit() {
+  function update() {
     refresh();
-    renderRuleList();
-    changed();
+    onEdit();
   }
 
   refresh();
@@ -481,19 +546,12 @@ function sessionField(rule) {
     h(
       "p",
       { class: "hint" },
-      "会话 ID 可以在聊天里发 /sid 获取。通配符 * 匹配任意字符、? 匹配单个字符；同一会话命中多条规则时，精确会话优先于通配符，其次按列表顺序。",
+      "会话 ID 可在聊天里发 /sid 获取。* 匹配任意字符、? 匹配单个字符；在前面加 ! 表示排除，例如 + 所有群聊 再加 !某个群。",
     ),
   );
 }
 
 function editorFoot(rule) {
-  const index = draft.rules.indexOf(rule);
-  const move = (offset) => () => {
-    const [item] = draft.rules.splice(index, 1);
-    draft.rules.splice(index + offset, 0, item);
-    renderAll();
-  };
-
   const remove = h("button", { class: "btn ghost small danger" }, "删除规则");
   remove.addEventListener("click", () => {
     // iframe 沙箱里没有 confirm()，用二次点击确认
@@ -506,6 +564,7 @@ function editorFoot(rule) {
       }, 3000);
       return;
     }
+    const index = draft.rules.indexOf(rule);
     draft.rules.splice(index, 1);
     selectedId = draft.rules[Math.max(0, index - 1)]?.id ?? null;
     renderAll();
@@ -515,25 +574,20 @@ function editorFoot(rule) {
     "div",
     { class: "editor-foot" },
     h(
-      "div",
-      { class: "row" },
-      h("button", { class: "btn ghost small", disabled: index === 0, onclick: move(-1) }, "上移"),
-      h("button", { class: "btn ghost small", disabled: index === draft.rules.length - 1, onclick: move(1) }, "下移"),
-      h(
-        "button",
-        {
-          class: "btn ghost small",
-          onclick: () =>
-            addRule({
-              ...rule,
-              id: Math.random().toString(16).slice(2, 10),
-              name: `${rule.name} 副本`,
-              plugins: [...rule.plugins],
-              sessions: [],
-            }),
-        },
-        "复制",
-      ),
+      "button",
+      {
+        class: "btn ghost small",
+        onclick: () =>
+          addRule({
+            ...rule,
+            id: newId(),
+            name: `${rule.name} 副本`,
+            plugins: [...rule.plugins],
+            exclusive: [],
+            sessions: [],
+          }),
+      },
+      "复制为新规则",
     ),
     remove,
   );
@@ -546,32 +600,36 @@ function renderTester() {
   const umo = $("test-umo").value.trim();
   if (!umo) {
     out.className = "test-result muted";
-    out.replaceChildren("输入会话 ID 看看会命中哪条规则");
+    out.replaceChildren("输入会话 ID 看看这个会话里哪些插件能用");
     return;
   }
   out.className = "test-result";
-  const [rule, via] = matchRule(umo);
-  const notes = [];
-  if (!draft.settings.enabled) notes.push(h("div", { class: "muted" }, "⚠ 总开关已关闭，规则暂不生效"));
-  if (!rule) {
-    out.replaceChildren(...notes, h("div", {}, "没有命中规则，所有插件照常响应"));
-    return;
-  }
-  const allowed = plugins.filter((p) => allows(rule, p.name));
-  out.replaceChildren(
-    ...notes,
+  const matched = draft.rules.filter((r) => r.enabled && covers(r, umo));
+  const results = plugins.map((p) => ({ p, reason: blockReason(p.name, matched) }));
+  const allowed = results.filter((r) => !r.reason);
+  const blocked = results.filter((r) => r.reason);
+
+  out.replaceChildren(h("div", {},
+    draft.settings.enabled ? null : h("div", { class: "warn" }, "⚠ 总开关已关闭，规则暂不生效"),
     h(
       "div",
       {},
-      "命中「",
-      h("b", {}, rule.name),
-      "」",
-      h("span", { class: `tag ${rule.mode}`, style: "margin: 0 6px" }, MODE_TEXT[rule.mode]),
-      h("span", { class: "muted" }, `（${via}${rule.strict ? "，严格模式" : ""}）`),
+      "命中规则：",
+      matched.length
+        ? matched.map((r) => [h("b", {}, r.name), h("span", { class: `tag ${r.mode}`, style: "margin: 0 8px 0 4px" }, MODE_TEXT[r.mode])])
+        : h("span", { class: "muted" }, "无"),
     ),
-    h("div", { class: "muted", style: "margin-top: 6px" }, `可用插件 ${allowed.length} / ${plugins.length}（系统插件始终可用）`),
-    h("div", { class: "plugins" }, ...allowed.map((p) => h("span", { class: "pill" }, p.display_name))),
-  );
+    h("div", { class: "muted", style: "margin-top: 8px" }, `可用插件 ${allowed.length} / ${plugins.length}（系统插件始终可用）`),
+    h("div", { class: "plugins" }, ...allowed.map(({ p }) => h("span", { class: "pill" }, p.display_name))),
+    blocked.length
+      ? h(
+          "div",
+          { class: "blocked" },
+          h("div", { class: "muted" }, `被拦插件 ${blocked.length}`),
+          ...blocked.map(({ p, reason }) => h("div", {}, h("span", { class: "pill off" }, p.display_name), h("span", { class: "muted" }, reason))),
+        )
+      : null,
+  ));
 }
 
 $("test-umo").addEventListener("input", renderTester);

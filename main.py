@@ -11,7 +11,7 @@ from astrbot.core.star.star import star_map
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from sqlmodel import col, select
 
-from .rules import Rule, RuleStore
+from .rules import Rule, RuleStore, Verdict
 
 PLUGIN_NAME = "astrbot_plugin_session_plugin_filter"
 PATCH_ATTR = "filter_handlers_by_session"
@@ -65,8 +65,8 @@ class SessionPluginFilter(Star):
         settings = self.store.settings
         if not settings["enabled"]:
             return handlers
-        rule = self.store.match(event.unified_msg_origin)
-        if rule is None or (settings["admin_bypass"] and event.is_admin()):
+        verdict = self.store.resolve(event.unified_msg_origin)
+        if verdict is None or (settings["admin_bypass"] and event.is_admin()):
             return handlers
 
         kept, blocked_command = [], False
@@ -75,15 +75,15 @@ class SessionPluginFilter(Star):
             if (
                 plugin is None
                 or self._is_exempt(plugin.name, plugin.reserved)
-                or rule.allows(plugin.name)
+                or verdict.allows(plugin.name)
             ):
                 kept.append(handler)
             elif any(isinstance(f, CommandFilter) for f in handler.event_filters):
                 blocked_command = True
 
-        if rule.strict:
+        if settings["strict"]:
             # plugins_name 会继续约束后续的事件钩子和 LLM 函数工具
-            event.plugins_name = self._narrow_plugins(rule, event.plugins_name)
+            event.plugins_name = self._narrow_plugins(verdict, event.plugins_name)
 
         if blocked_command and settings["silent_blocked_command"]:
             if kept:
@@ -92,12 +92,12 @@ class SessionPluginFilter(Star):
                 event.stop_event()
         return kept
 
-    def _narrow_plugins(self, rule: Rule, current: list[str] | None) -> list[str]:
+    def _narrow_plugins(self, verdict: Verdict, current: list[str] | None) -> list[str]:
         names = [
             star.name
             for star in self.context.get_all_stars()
             if star.name
-            and (self._is_exempt(star.name, star.reserved) or rule.allows(star.name))
+            and (self._is_exempt(star.name, star.reserved) or verdict.allows(star.name))
         ]
         if current is not None:
             names = [name for name in names if name in current]
@@ -122,28 +122,35 @@ class SessionPluginFilter(Star):
     async def pf_status(self, event: AstrMessageEvent):
         """查看当前会话命中的规则"""
         umo = event.unified_msg_origin
-        rule = self.store.match(umo)
+        verdict = self.store.resolve(umo)
         lines = [f"会话：{umo}"]
         if not self.store.settings["enabled"]:
             lines.append("插件过滤总开关已关闭")
-        if rule is None:
-            lines.append("没有命中任何规则，所有插件照常工作")
+        if verdict is None:
+            lines.append("没有规则影响这个会话，所有插件照常工作")
         else:
-            lines.append(f"命中规则：{rule.name}（{MODE_LABELS[rule.mode]}）")
-            allowed = [
-                star.display_name or star.name
+            names = "、".join(
+                f"{r.name}（{MODE_LABELS[r.mode]}）" for r in verdict.rules
+            )
+            lines.append(f"命中规则：{names or '无'}")
+            stars = [
+                star
                 for star in self.context.get_all_stars()
-                if star.name
-                and not self._is_exempt(star.name, star.reserved)
-                and rule.allows(star.name)
+                if star.name and not self._is_exempt(star.name, star.reserved)
             ]
-            lines.append(f"可用插件（{len(allowed)}）：" + ("、".join(allowed) or "无"))
+            allowed = [
+                s.display_name or s.name for s in stars if verdict.allows(s.name)
+            ]
+            lines.append(
+                f"可用插件（{len(allowed)}/{len(stars)}）："
+                + ("、".join(allowed) or "无")
+            )
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @pf.command("bind")
     async def pf_bind(self, event: AstrMessageEvent, rule_name: str):
-        """把当前会话绑定到指定规则"""
+        """把当前会话加入指定规则"""
         target = next(
             (r for r in self.store.rules if rule_name in (r.name, r.id)), None
         )
@@ -153,12 +160,11 @@ class SessionPluginFilter(Star):
         umo = event.unified_msg_origin
         data = self.store.to_dict()
         for rule in data["rules"]:
-            rule["sessions"] = [s for s in rule["sessions"] if s != umo]
-            if rule["id"] == target.id:
+            if rule["id"] == target.id and umo not in rule["sessions"]:
                 rule["sessions"].append(umo)
         self.store.update(data)
         self.store.save()
-        yield event.plain_result(f"已把当前会话绑定到规则「{target.name}」")
+        yield event.plain_result(f"已把当前会话加入规则「{target.name}」")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @pf.command("unbind")
@@ -223,7 +229,6 @@ class SessionPluginFilter(Star):
                 {
                     "name": f"原生规则导入 #{i}",
                     "mode": "blacklist",
-                    "strict": False,
                     "plugins": list(disabled),
                     "sessions": umos,
                 }
