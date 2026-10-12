@@ -109,7 +109,7 @@ class Verdict:
             if not rule.allows(plugin_name):
                 return rule
         owners = self.exclusive.get(plugin_name)
-        if owners and not any(rule in self.rules for rule in owners):
+        if owners and not any(o is r for o in owners for r in self.rules):
             return owners[0]
         return None
 
