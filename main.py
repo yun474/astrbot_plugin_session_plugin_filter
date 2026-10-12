@@ -16,6 +16,8 @@ from .rules import NO_PERSONA, Rule, RuleStore, Verdict
 
 PLUGIN_NAME = "astrbot_plugin_session_plugin_filter"
 PATCH_ATTR = "filter_handlers_by_session"
+# 不经过消息流水线的事件（如官方 SDK 的进群事件）只能靠插件主动查询这个接口
+ENABLED_ATTR = "is_plugin_enabled_for_session"
 MODE_LABELS = {"whitelist": "白名单", "blacklist": "黑名单"}
 SETTING_LABELS = {
     "session_enabled": "会话",
@@ -65,25 +67,49 @@ class SessionPluginFilter(Star):
     # ---------- 插件过滤 ----------
 
     def _install_patch(self) -> None:
-        current = getattr(SessionPluginManager, PATCH_ATTR)
         # 热重载时可能拿到上一个实例的包装，剥掉它避免套娃
-        original = getattr(current, "__spf_original__", current)
+        originals = {}
+        for attr in (PATCH_ATTR, ENABLED_ATTR):
+            current = getattr(SessionPluginManager, attr)
+            originals[attr] = getattr(current, "__spf_original__", current)
+        filter_original = originals[PATCH_ATTR]
+        enabled_original = originals[ENABLED_ATTR]
 
-        async def patched(event: AstrMessageEvent, handlers: list) -> list:
-            handlers = await original(event, handlers)
+        async def patched_filter(event: AstrMessageEvent, handlers: list) -> list:
+            handlers = await filter_original(event, handlers)
             return self.apply_rules(event, handlers)
 
-        patched.__spf_original__ = original
-        self._original, self._patched = original, patched
-        setattr(SessionPluginManager, PATCH_ATTR, staticmethod(patched))
+        async def patched_enabled(session_id: str, plugin_name: str) -> bool:
+            if not await enabled_original(session_id, plugin_name):
+                return False
+            return self.plugin_allowed(session_id, plugin_name)
+
+        self._originals = originals
+        self._patches = {PATCH_ATTR: patched_filter, ENABLED_ATTR: patched_enabled}
+        for attr, patched in self._patches.items():
+            patched.__spf_original__ = originals[attr]
+            setattr(SessionPluginManager, attr, staticmethod(patched))
 
     async def terminate(self):
-        if getattr(SessionPluginManager, PATCH_ATTR) is self._patched:
-            setattr(SessionPluginManager, PATCH_ATTR, staticmethod(self._original))
+        for attr, patched in self._patches.items():
+            if getattr(SessionPluginManager, attr) is patched:
+                setattr(SessionPluginManager, attr, staticmethod(self._originals[attr]))
         self.overlay.uninstall()
 
     def _is_exempt(self, plugin_name: str | None, reserved: bool) -> bool:
         return reserved or plugin_name == PLUGIN_NAME
+
+    def plugin_allowed(self, umo: str, plugin_name: str) -> bool:
+        """没有消息事件时按规则判断插件能否在会话中使用，管理员放行对此不适用"""
+        if not self.store.settings["enabled"]:
+            return True
+        star = next(
+            (s for s in self.context.get_all_stars() if s.name == plugin_name), None
+        )
+        if self._is_exempt(plugin_name, bool(star and star.reserved)):
+            return True
+        verdict = self.store.resolve(umo)
+        return verdict is None or verdict.allows(plugin_name)
 
     def apply_rules(self, event: AstrMessageEvent, handlers: list) -> list:
         self._remember_session(event)
