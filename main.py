@@ -4,18 +4,39 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 from astrbot.api.web import error_response, json_response, request
-from astrbot.core.db.po import ConversationV2, Preference
+from astrbot.core.db.po import ConversationV2
 from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.session_plugin_manager import SessionPluginManager
 from astrbot.core.star.star import star_map
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
-from sqlmodel import col, select
+from sqlmodel import select
 
-from .rules import Rule, RuleStore, Verdict
+from .native import PreferenceOverlay, clear_native_rules, import_native_rules
+from .rules import NO_PERSONA, Rule, RuleStore, Verdict
 
 PLUGIN_NAME = "astrbot_plugin_session_plugin_filter"
 PATCH_ATTR = "filter_handlers_by_session"
 MODE_LABELS = {"whitelist": "白名单", "blacklist": "黑名单"}
+SETTING_LABELS = {
+    "session_enabled": "会话",
+    "llm_enabled": "LLM",
+    "tts_enabled": "TTS",
+    "persona": "人格",
+    "chat_provider": "对话模型",
+    "stt_provider": "语音识别模型",
+    "tts_provider": "语音合成模型",
+    "kb": "知识库",
+}
+
+
+def describe_setting(key: str, value) -> str:
+    if isinstance(value, bool):
+        return "开启" if value else "关闭"
+    if key == "persona" and value == NO_PERSONA:
+        return "不使用人格"
+    if key == "kb":
+        return f"{len(value['ids'])} 个知识库" if value["ids"] else "不使用知识库"
+    return str(value)
 
 
 class SessionPluginFilter(Star):
@@ -28,17 +49,20 @@ class SessionPluginFilter(Star):
         # 最近出现过的会话 -> 群名/昵称，给面板的会话选择器用
         self.recent_sessions: dict[str, str] = {}
         self._install_patch()
+        self.overlay = PreferenceOverlay(self.store)
+        self.overlay.install()
 
         for route, handler, methods in (
             ("state", self.api_state, ["GET"]),
             ("save", self.api_save, ["POST"]),
             ("import_native", self.api_import_native, ["POST"]),
+            ("clear_native", self.api_clear_native, ["POST"]),
         ):
             context.register_web_api(
-                f"/{PLUGIN_NAME}/{route}", handler, methods, f"会话插件过滤 {route}"
+                f"/{PLUGIN_NAME}/{route}", handler, methods, f"会话规则 {route}"
             )
 
-    # ---------- 过滤核心 ----------
+    # ---------- 插件过滤 ----------
 
     def _install_patch(self) -> None:
         current = getattr(SessionPluginManager, PATCH_ATTR)
@@ -56,6 +80,7 @@ class SessionPluginFilter(Star):
     async def terminate(self):
         if getattr(SessionPluginManager, PATCH_ATTR) is self._patched:
             setattr(SessionPluginManager, PATCH_ATTR, staticmethod(self._original))
+        self.overlay.uninstall()
 
     def _is_exempt(self, plugin_name: str | None, reserved: bool) -> bool:
         return reserved or plugin_name == PLUGIN_NAME
@@ -115,35 +140,40 @@ class SessionPluginFilter(Star):
 
     @filter.command_group("pf")
     def pf(self):
-        """会话插件过滤"""
+        """会话规则"""
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @pf.command("status")
     async def pf_status(self, event: AstrMessageEvent):
-        """查看当前会话命中的规则"""
+        """查看当前会话命中的规则、可用插件和会话设置"""
         umo = event.unified_msg_origin
-        verdict = self.store.resolve(umo)
         lines = [f"会话：{umo}"]
         if not self.store.settings["enabled"]:
-            lines.append("插件过滤总开关已关闭")
-        if verdict is None:
-            lines.append("没有规则影响这个会话，所有插件照常工作")
-        else:
-            names = "、".join(
-                f"{r.name}（{MODE_LABELS[r.mode]}）" for r in verdict.rules
-            )
-            lines.append(f"命中规则：{names or '无'}")
-            stars = [
-                star
-                for star in self.context.get_all_stars()
-                if star.name and not self._is_exempt(star.name, star.reserved)
-            ]
-            allowed = [
-                s.display_name or s.name for s in stars if verdict.allows(s.name)
-            ]
+            lines.append("规则总开关已关闭，以下内容暂不生效")
+        rules = [r for r in self.store.rules if r.enabled and r.covers(umo)]
+        names = "、".join(
+            r.name + (f"（{MODE_LABELS[r.mode]}）" if r.restricts_plugins else "")
+            for r in rules
+        )
+        lines.append(f"命中规则：{names or '无'}")
+
+        verdict = self.store.resolve(umo)
+        stars = [
+            star
+            for star in self.context.get_all_stars()
+            if star.name and not self._is_exempt(star.name, star.reserved)
+        ]
+        allowed = [
+            s.display_name or s.name
+            for s in stars
+            if verdict is None or verdict.allows(s.name)
+        ]
+        lines.append(
+            f"可用插件（{len(allowed)}/{len(stars)}）：" + ("、".join(allowed) or "无")
+        )
+        for key, (value, rule) in self.store.overrides(umo).items():
             lines.append(
-                f"可用插件（{len(allowed)}/{len(stars)}）："
-                + ("、".join(allowed) or "无")
+                f"{SETTING_LABELS[key]}：{describe_setting(key, value)}（来自「{rule.name}」）"
             )
         yield event.plain_result("\n".join(lines))
 
@@ -196,6 +226,7 @@ class SessionPluginFilter(Star):
                 **self.store.to_dict(),
                 "plugins": sorted(plugins, key=lambda p: p["display_name"].lower()),
                 "sessions": await self._known_sessions(),
+                "options": await self._setting_options(),
             }
         )
 
@@ -205,37 +236,34 @@ class SessionPluginFilter(Star):
             return error_response("配置格式不对")
         self.store.update(payload)
         self.store.save()
-        logger.info(f"会话插件过滤规则已保存，共 {len(self.store.rules)} 条")
+        logger.info(f"会话规则已保存，共 {len(self.store.rules)} 条")
         return json_response(self.store.to_dict())
 
     async def api_import_native(self):
-        """把原生「自定义规则」里的插件禁用配置转成黑名单规则（不落盘，由面板保存）"""
-        groups: dict[tuple[str, ...], list[str]] = {}
-        async with self.context.get_db().get_db() as session:
-            result = await session.execute(
-                select(Preference).where(
-                    col(Preference.scope) == "umo",
-                    col(Preference.key) == "session_plugin_config",
-                )
-            )
-            for pref in result.scalars().all():
-                conf = (pref.value or {}).get("val", {}).get(pref.scope_id, {})
-                disabled = tuple(sorted(conf.get("disabled_plugins") or []))
-                if disabled:
-                    groups.setdefault(disabled, []).append(pref.scope_id)
+        """把原生自定义规则转成本插件的规则（不落盘，由面板保存）"""
+        rules = await import_native_rules(self.context.get_db())
+        return json_response({"rules": [Rule.from_dict(r).to_dict() for r in rules]})
 
-        rules = [
-            Rule.from_dict(
-                {
-                    "name": f"原生规则导入 #{i}",
-                    "mode": "blacklist",
-                    "plugins": list(disabled),
-                    "sessions": umos,
-                }
-            ).to_dict()
-            for i, (disabled, umos) in enumerate(groups.items(), start=1)
-        ]
-        return json_response({"rules": rules})
+    async def api_clear_native(self):
+        count = await clear_native_rules(self.context.get_db())
+        logger.info(f"已清除 {count} 个会话的原生自定义规则")
+        return json_response({"count": count})
+
+    async def _setting_options(self) -> dict:
+        def providers(insts) -> list[dict]:
+            return [{"id": p.meta().id, "model": p.meta().model} for p in insts]
+
+        kbs = await self.context.kb_manager.list_kbs()
+        return {
+            "personas": [p["name"] for p in self.context.persona_manager.personas_v3],
+            "chat_providers": providers(self.context.get_all_providers()),
+            "stt_providers": providers(self.context.get_all_stt_providers()),
+            "tts_providers": providers(self.context.get_all_tts_providers()),
+            "kbs": [
+                {"id": kb.kb_id, "name": kb.kb_name, "emoji": kb.emoji or ""}
+                for kb in kbs
+            ],
+        }
 
     async def _known_sessions(self) -> list[dict]:
         db = self.context.get_db()

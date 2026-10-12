@@ -1,14 +1,14 @@
 {
   "views": {
     "settings": {
-      "title": "会话插件过滤",
-      "description": "编辑各会话的插件白名单/黑名单规则"
+      "title": "会话规则",
+      "description": "按会话管理插件权限、会话开关、人格、模型和知识库"
     }
   },
   "pages": {
     "settings": {
-      "title": "会话插件过滤",
-      "description": "编辑各会话的插件白名单/黑名单规则"
+      "title": "会话规则",
+      "description": "按会话管理插件权限、会话开关、人格、模型和知识库"
     }
   }
 }

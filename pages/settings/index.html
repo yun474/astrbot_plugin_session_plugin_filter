@@ -3,14 +3,14 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>会话插件过滤</title>
+    <title>会话规则</title>
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
     <header class="topbar">
       <div>
-        <h1>会话插件过滤</h1>
-        <p class="muted">按会话决定哪些插件能用。一个会话命中多条规则时叠加生效，插件要每条都放行才能用。</p>
+        <h1>会话规则</h1>
+        <p class="muted">按会话管理插件权限，以及会话开关、人格、模型、知识库。一条规则可以管很多个会话。</p>
       </div>
       <div class="topbar-actions">
         <span id="dirty" class="dirty" hidden>有未保存的修改</span>
@@ -23,7 +23,7 @@
       <label class="switch-row">
         <input type="checkbox" data-setting="enabled" />
         <span class="switch"></span>
-        <span><b>启用插件过滤</b><small>总开关，关闭后所有规则暂停生效</small></span>
+        <span><b>启用规则</b><small>总开关，关闭后所有规则暂停生效</small></span>
       </label>
       <label class="switch-row">
         <input type="checkbox" data-setting="strict" />
@@ -38,7 +38,7 @@
       <label class="switch-row">
         <input type="checkbox" data-setting="admin_bypass" />
         <span class="switch"></span>
-        <span><b>管理员不受限制</b><small>AstrBot 管理员在任何会话都能用全部插件</small></span>
+        <span><b>管理员不受插件限制</b><small>AstrBot 管理员在任何会话都能用全部插件</small></span>
       </label>
     </section>
 
@@ -46,13 +46,11 @@
       <aside class="card rules">
         <div class="section-head">
           <h2>规则</h2>
-          <div class="row">
-            <button id="import-native" class="btn ghost small" title="把原生自定义规则里的插件禁用配置转成黑名单规则">导入原生</button>
-            <button id="add-rule" class="btn small">新建</button>
-          </div>
+          <button id="add-rule" class="btn small">新建</button>
         </div>
         <ol id="rule-list" class="rule-list"></ol>
         <p id="rule-empty" class="empty" hidden>还没有规则，点「新建」开一条吧</p>
+        <p class="hint">插件权限：命中的规则叠加生效。会话设置：精确会话优先于通配符，同级时靠前的规则优先。</p>
       </aside>
 
       <section id="editor" class="card editor"></section>
@@ -61,7 +59,20 @@
     <section class="card tester">
       <div class="section-head"><h2>命中测试</h2><span class="muted">按当前（含未保存）配置预览</span></div>
       <input id="test-umo" class="input" list="session-options" placeholder="输入会话 ID，例如 aiocqhttp:GroupMessage:123456" />
-      <div id="test-result" class="test-result muted">输入会话 ID 看看这个会话里哪些插件能用</div>
+      <div id="test-result" class="test-result muted"></div>
+    </section>
+
+    <section class="card migrate">
+      <div class="section-head"><h2>从原生自定义规则迁移</h2></div>
+      <ol class="steps">
+        <li>点「导入原生规则」，把原生自定义规则里的插件、会话开关、人格、模型、知识库配置转成规则</li>
+        <li>检查导入的规则，没问题就保存</li>
+        <li>点「清除原生规则」，避免两边重复生效。会话备注名会保留</li>
+      </ol>
+      <div class="row">
+        <button id="import-native" class="btn small">导入原生规则</button>
+        <span id="clear-native-slot"></span>
+      </div>
     </section>
 
     <datalist id="session-options"></datalist>
